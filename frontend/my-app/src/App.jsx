@@ -1,5 +1,7 @@
 import React, { useState} from "react";
 import Visualization from "./Visualization";
+import ShapHeatmap from "./ShapHeatmap";
+import IgHeatmap from "./IgHeatmap";
 
 export default function App() {
   const [files, setFiles] = useState([]);
@@ -13,6 +15,7 @@ export default function App() {
   const [plotDataTSNE, setPlotDataTSNE] = useState(null);
   const [selectedModel, setSelectedModel] = useState("logreg");
   const [testSize, setTestSize] = useState(0.3);
+  const [selectedNewsId, setSelectedNewsId] = useState(null);
 
   const callApi = async (url, method = "GET", body = null, setFunc = setOutput) => {
     const opts = { method, headers: { "Content-Type": "application/json" } };
@@ -100,10 +103,10 @@ export default function App() {
   // --- Прогноз ---
   const handleRandomPredict = async () => {
     try {
-      const res = await fetch(`${process.env.REACT_APP_API_URL}/api/ml/random_predict`);
+      const res = await fetch(`${process.env.REACT_APP_API_URL}/api/ml/random_predict?model_name=${selectedModel}`);
       const data = await res.json();
       setRandomResult(data);
-
+      setSelectedNewsId(data.news_id);
       
     } catch (err) {
       console.error("Random predict error:", err);
@@ -113,16 +116,35 @@ export default function App() {
 
   // --- Пояснення ---
   const fetchExplanation = async (method) => {
-    await callApi(`/api/ml/interpret/${method}`, "GET", null, (data) => {
-      setExplanations((prev) => ({ ...prev, [method]: data }));
-    });
+    if (!selectedNewsId) {
+      alert("⚠️ Спочатку отримай рандомну новину, щоб створити пояснення!");
+      return;
+    }
+
+    // Перевіряємо, чи метод підтримується обраною моделлю
+    if (selectedModel === "logreg" && (method === "ig" || method === "tcav")) {
+      alert("⚠️ Цей тип пояснення недоступний для Logistic Regression. Використай BERT-tiny.");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${process.env.REACT_APP_API_URL}/api/ml/interpret/${method.toUpperCase()}?news_id=${selectedNewsId}&model_name=${selectedModel}`, {
+        method: "POST"
+      });
+      const data = await res.json();
+      setExplanations((prev) => ({ ...prev, [method.toUpperCase()]: data.payload }));
+      alert(`✅ Пояснення ${method.toUpperCase()} отримано! Fidelity: ${data.fidelity}`);
+    } catch (err) {
+      console.error("Interpretation error:", err);
+      alert("⚠️ Сталася помилка при отриманні пояснення.");
+    }
   };
 
   // --- Візуалізація ---
   const fetchVisualization = async (method, setData) => {
     console.log(`🔹 Fetching visualization: ${method}`);
     try {
-      const res = await fetch(`${process.env.REACT_APP_API_URL}/api/ml/visualize/${method}`);
+      const res = await fetch(`${process.env.REACT_APP_API_URL}/api/ml/visualize/${method}?model_name=${selectedModel}`);
       const data = await res.json();
       console.log("📌 Visualization data:", data);
 
@@ -230,7 +252,9 @@ export default function App() {
         {randomResult && (
           <div className="mb-6 p-4 bg-gray-100 border rounded">
             <h3 className="font-semibold">🎲 Рандомний прогноз</h3>
-            <p><b>Текст новини:</b> {randomResult.text.slice(0, 200)}...</p>
+            <p><b>Текст новини:</b> {randomResult.text.length > 200
+              ? randomResult.text.slice(0, 200) + "..."
+              : randomResult.text}</p>
             <p><b>Прогноз:</b> {randomResult.prediction.predicted_label}</p>
             <p><b>Впевненість:</b> {(randomResult.prediction.probability * 100).toFixed(2)}%</p>
             <p><b>Справжня мітка:</b> {randomResult.true_label}</p>
@@ -296,22 +320,13 @@ export default function App() {
         <div className="mt-6">
           <h2 className="text-lg font-semibold">Пояснення</h2>
           <div className="flex gap-2 mt-2">
-            <button
-              className="px-3 py-1 bg-yellow-500 text-white rounded"
-              onClick={() => fetchExplanation("shap")}
-            >
+            <button className="px-3 py-1 bg-yellow-500 text-white rounded" onClick={() => fetchExplanation("shap")}>
               SHAP
             </button>
-            <button
-              className="px-3 py-1 bg-red-500 text-white rounded"
-              onClick={() => fetchExplanation("ig")}
-            >
+            <button className="px-3 py-1 bg-red-500 text-white rounded" onClick={() => fetchExplanation("ig")}>
               IG
             </button>
-            <button
-              className="px-3 py-1 bg-gray-700 text-white rounded"
-              onClick={() => fetchExplanation("tcav")}
-            >
+            <button className="px-3 py-1 bg-gray-700 text-white rounded" disabled>
               TCAV
             </button>
           </div>
@@ -321,11 +336,23 @@ export default function App() {
         {Object.keys(explanations).length > 0 && (
           <div className="mt-4">
             {Object.entries(explanations).map(([method, data]) => (
-              <div key={method} className="mb-4">
-                <h4 className="font-semibold">{method.toUpperCase()}</h4>
-                <pre className="bg-gray-100 p-2 rounded">
-                  {JSON.stringify(data, null, 2)}
-                </pre>
+              <div key={method} className="mb-6">
+
+                {/* <h4 className="font-semibold mb-2">{method.toUpperCase()}</h4> */}
+
+                {/* JSON формат пояснення */}
+                {/* <pre className="bg-gray-100 p-2 rounded text-sm overflow-x-auto mb-2"> */}
+                  {/* {JSON.stringify(data, null, 2)} */}
+                {/* </pre>*/}
+
+                {/* Візуалізація SHAP (теплова карта) */}
+                {method.toUpperCase() === "SHAP" && randomResult?.text && (
+                  <ShapHeatmap payload={data} text={randomResult.text} />
+                )}
+
+                {method.toUpperCase() === "IG" && randomResult?.text && (
+                  <IgHeatmap payload={data} text={randomResult.text} />
+                )}
               </div>
             ))}
           </div>
