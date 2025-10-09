@@ -3,10 +3,11 @@ from typing import List
 import pandas as pd
 from app.preprocess import clean_text, preprocess_dataset
 from app.db import save_news_and_labels, save_explanation
-from app.model import FakeNewsClassifier, TransformerClassifier
+from app.model import FakeNewsClassifier, BertTinyClassifier
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 import random
 
 app = FastAPI(title="FakeNews ML Service")
@@ -23,7 +24,7 @@ app.add_middleware(
 # ====== Моделі ======
 models = {
     "logreg": FakeNewsClassifier(),
-    "transformer": TransformerClassifier()
+    "bert-tiny": BertTinyClassifier()
 }
 
 model_status = {name: {"running": False, "metrics": None, "ready": False} for name in models.keys()}
@@ -36,14 +37,14 @@ def get_model(name: str):
 # ====== Pydantic Models ======
 class PredictRequest(BaseModel):
     news_text: str
-    model_name: str = Field("logreg", description="Назва моделі: logreg або transformer")
+    model_name: str = Field("logreg", description="Назва моделі: logreg або bert-tiny")
     
     class Config:
         protected_namespaces = ()
 
 
 class AnalyzeRequest(BaseModel):
-    model_name: str = Field("logreg", description="Назва моделі: logreg або transformer")
+    model_name: str = Field("logreg", description="Назва моделі: logreg або bert-tiny")
     test_size: float = Field(0.3, alias="testSize")
     max_iter: int = 10
     C: float = 1.0
@@ -97,29 +98,31 @@ def analyze_all(request: AnalyzeRequest, background_tasks: BackgroundTasks):
                 )
                 metrics = getattr(ml_model, "train_metrics", None)
 
-            # --- TransformerClassifier ---
+            # --- BertTinyClassifier ---
             elif hasattr(ml_model, "train"):
-                from app.db import load_training_data
+                from app.db import load_all_texts, load_all_labels, load_all_news_ids
 
-                df = load_training_data()
-                if df.empty:
+                texts = load_all_texts()
+                labels = load_all_labels()
+                news_ids = load_all_news_ids()
+
+                if not texts or not labels or not news_ids:
                     raise HTTPException(status_code=400, detail="Немає даних для тренування")
 
-                texts = df["text"].tolist()
-                labels = df["label"].tolist()
-                news_ids = df["id"].tolist()
-
-                metrics = ml_model.train(texts=texts, labels=labels, test_size=getattr(request, "test_size", 0.3))
-                
-                if hasattr(ml_model, "save_embeddings_and_predictions"):
-                    ml_model.save_embeddings_and_predictions(news_ids=news_ids, texts=texts)
+                metrics = ml_model.train(texts=texts, 
+                                         labels=labels, 
+                                         test_size=getattr(request, "test_size", 0.3))
 
             else:
-                raise HTTPException(status_code=400, detail=f"Модель '{request.model_name}' не підтримує тренування")
+                raise HTTPException(status_code=400, 
+                                    detail=f"Модель '{request.model_name}' не підтримує тренування")
 
             # Оновлюємо статус
             model_status[request.model_name]["metrics"] = metrics
             model_status[request.model_name]["ready"] = True
+
+            # --- ✅ Зберігаємо оновлену модель у пам'яті ---
+            models[request.model_name] = ml_model
 
         finally:
             model_status[request.model_name]["running"] = False
@@ -139,7 +142,7 @@ def analyze_all(request: AnalyzeRequest, background_tasks: BackgroundTasks):
     }
 
 @app.get("/analyze/status")
-def analyze_status(model_name: str = Query("logreg", description="Назва моделі: logreg або transformer")):
+def analyze_status(model_name: str = Query("logreg", description="Назва моделі")):
     status = model_status.get(model_name)
     if not status:
         raise HTTPException(status_code=400, detail=f"Unknown model '{model_name}'")
@@ -160,9 +163,8 @@ def predict(req: PredictRequest):
 
 
 @app.get("/random_predict")
-def random_predict(model_name: str = Query("logreg", description="Назва моделі: logreg або transformer")):
+def random_predict(model_name: str = Query("logreg", description="Назва моделі")):
     ml_model = get_model(model_name)
-
     if not ml_model.is_trained():
         raise HTTPException(status_code=400, detail=f"Модель '{model_name}' ще не натренована.")
 
@@ -174,59 +176,133 @@ def random_predict(model_name: str = Query("logreg", description="Назва м�
             return {"error": "База новин порожня"}
         random_id = random.choice(news_ids)[0]
 
-        query = text("""
+        row = conn.execute(text("""
             SELECT n.text, l.predicted_label, l.confidence, l.label
             FROM NewsItem n
             JOIN Label l ON n.id = l.news_id
             WHERE n.id = :news_id
-        """)
-        row = conn.execute(query, {"news_id": random_id}).fetchone()
+        """), {"news_id": random_id}).fetchone()
 
         if not row:
             return {"error": f"Не знайдено прогнозу для новини {random_id}"}
-
+        
+        text_item = row.text
         predicted_label = "real" if row.predicted_label == 0 else "fake"
         true_label = "real" if row.label is False else "fake"
 
+        explanations_created = []
+        supported_methods = {
+            "logreg": ["SHAP"],
+            "bert-tiny": ["SHAP", "IG", "TCAV"]
+        }
+
+        for method in supported_methods.get(model_name, []):
+            try:
+
+                if method == "SHAP":
+                    if model_name == "bert-tiny":
+                        shap_result = ml_model.explain_shap(text_item)
+                    else: 
+                        shap_result = ml_model.explain_shap([text_item])
+
+                    # беремо лише scores для fidelity
+                    if isinstance(shap_result, list) and "scores" in shap_result[0]:
+                        values = shap_result[0]["scores"]
+                    else:
+                        values = shap_result
+
+                elif method == "IG":
+                    ig_result = ml_model.explain_ig(text_item)
+                    values = ig_result["scores"]
+                elif method == "TCAV":
+                    values = ml_model.explain_tcav([text_item])
+                else:
+                    continue
+
+                # --- Перевірка даних ---
+                if not values or len(values) == 0 :
+                    print(f"⚠️ {method} повернув порожні значення")
+                    fidelity = None
+                else:
+                    # --- Обчислення fidelity ---
+                    p_orig = ml_model.predict_proba([text_item])[0][1]
+                    weights = np.array(values)
+                    threshold = np.percentile(np.abs(weights), 70)
+                    modified_input = np.copy(weights)
+                    modified_input[np.abs(weights) < threshold] = 0
+
+                    try:
+                        if model_name == "bert-tiny" and hasattr(ml_model, "predict_proba_embedded"):
+                            mask = np.ones_like(weights, dtype=int)
+                            mask[np.abs(weights) < threshold] = 0
+                            p_expl = ml_model.predict_proba_embedded([text_item], mask=mask)[0][1]
+                        elif hasattr(ml_model, "predict_proba_embedded"):
+                            p_expl = ml_model.predict_proba_embedded(modified_input)[0][1]
+                        else:
+                            p_expl = p_orig
+                    except Exception as e:
+                        print(f"⚠️ predict_proba_embedded failed: {e}")
+                        p_expl = p_orig
+
+                    fidelity = float(1 - abs(p_orig - p_expl))
+
+                # --- Зберігаємо у базу ---
+                save_explanation(random_id, method, values, fidelity)
+                explanations_created.append(method)
+
+            except Exception as e:
+                print(f"⚠️ Explanation for {method} failed: {e}")
+
         return {
+            "news_id": random_id,
             "model": model_name,
-            "id": random_id,
-            "text": row.text,
+            "text": text_item[:300] + "..." if len(text_item) > 300 else text_item,
             "prediction": {
                 "predicted_label": predicted_label,
                 "probability": float(row.confidence)
             },
-            "true_label": true_label
+            "true_label": true_label,
+            "created_explanations": explanations_created
         }
+
 
 # ====== Interpretability ======
 @app.post("/interpret/{method}")
-def interpret(method: str, news_id: int, model_name: str = Query("logreg", description="Назва моделі: logreg або transformer")):
-    ml_model = get_model(model_name)
+def interpret(method: str, news_id: int, model_name: str = Query("logreg")):
     engine = create_engine("postgresql+psycopg2://postgres:100317@db/fakenewsdb")
 
-    df = pd.read_sql(f"SELECT id, text FROM NewsItem WHERE id={news_id}", engine)
+    query = text("""
+        SELECT e.payload, e.fidelity
+        FROM Explanation e
+        JOIN Embedding em ON e.news_id = em.news_id
+        WHERE e.news_id = :news_id
+        AND em.model_id = :model_id
+        AND e.method = :method
+        ORDER BY e.id DESC
+        LIMIT 1;
+    """)
+
+    df = pd.read_sql(query, engine, params={
+        "news_id": news_id,
+        "model_id": model_name,
+        "method": method.upper()
+    })
+
     if df.empty:
-        raise HTTPException(status_code=404, detail="News not found")
+        raise HTTPException(status_code=404, detail="Пояснення не знайдено. Спочатку створіть його через /random_predict")
 
-    text_item = df.iloc[0]["text"]
-
-    if method.upper() == "SHAP":
-        values = ml_model.explain_shap([text_item])
-    elif method.upper() == "IG":
-        values = ml_model.explain_ig([text_item])
-    elif method.upper() == "TCAV":
-        values = ml_model.explain_tcav([text_item])
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown method '{method}'")
-
-    exp_id = save_explanation(news_id, method.upper(), values, fidelity=None)
-    return {"news_id": news_id, "model": model_name, "method": method.upper(), "explanation_id": exp_id, "payload": values}
+    return {
+        "news_id": news_id,
+        "model": model_name,
+        "method": method.upper(),
+        "payload": df.iloc[0]["payload"],
+        "fidelity": df.iloc[0]["fidelity"],
+    }
 
 
 # ====== Visualization ======
 @app.get("/visualize/{method}")
-def visualize(method: str, model_name: str = Query("logreg", description="Назва моделі: logreg або transformer")):
+def visualize(method: str, model_name: str = Query("logreg")):
     method_clean = method.replace('"', '').strip().upper()
 
     if method_clean not in ["TSNE", "UMAP"]:
@@ -239,9 +315,11 @@ def visualize(method: str, model_name: str = Query("logreg", description="Наз
         FROM ProjectionPoint p
         JOIN NewsItem n ON p.news_id = n.id
         JOIN Label l ON n.id = l.news_id
+        JOIN Embedding e ON p.news_id = e.news_id
         WHERE UPPER(TRIM(BOTH '"' FROM p.method)) = :method
+         AND e.model_id = :model
     """)
-    df_coords = pd.read_sql(query, engine, params={"method": method_clean})
+    df_coords = pd.read_sql(query, engine, params={"method": method_clean, "model": model_name})
 
     if df_coords.empty:
         return {"ids": [], "points": [], "labels": [], "predicted_labels": []}
