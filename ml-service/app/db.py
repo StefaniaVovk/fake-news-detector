@@ -126,7 +126,10 @@ def save_explanation(news_id, method, payload, fidelity=None):
         exp_id = cur.fetchone()[0]
         conn.commit()
     conn.close()
-    print(f"💾 Explanation {method} для news_id={news_id} збережено (id={exp_id}).")
+    try:
+       print(f"💾 Explanation {method} для news_id={news_id} збережено (id={exp_id}).")
+    except Exception as e:
+        print(f"⚠️ Не вдалося зберегти пояснення: {e}")
     return exp_id
 
 
@@ -154,15 +157,26 @@ def save_projection_points(news_ids, method, coords, meta=None):
     conn.close()
     print(f"💾 ProjectionPoints ({method}) збережено: {len(news_ids)} записів.")
 
-def load_training_data():
-    """Завантажує дані для тренування (id, text, label), відсортовані за ID."""
+def load_all_texts():
     engine = create_engine("postgresql+psycopg2://postgres:100317@db/fakenewsdb")
-    query = """
-        SELECT n.id, n.text, l.label
-        FROM NewsItem n
-        JOIN Label l ON n.id = l.news_id
-        WHERE l.predicted_label IS NULL
-        ORDER BY n.id;
-    """
-    df = pd.read_sql(query, engine)
-    return df
+    df = pd.read_sql(
+        "SELECT n.text FROM NewsItem n JOIN Label l ON n.id = l.news_id WHERE l.predicted_label IS NULL;",
+        engine
+    )
+    return df["text"].tolist() if not df.empty else []
+
+def load_all_labels():
+    engine = create_engine("postgresql+psycopg2://postgres:100317@db/fakenewsdb")
+    df = pd.read_sql(
+        "SELECT l.label FROM NewsItem n JOIN Label l ON n.id = l.news_id WHERE l.predicted_label IS NULL;",
+        engine
+    )
+    return df["label"].tolist() if not df.empty else []
+
+def load_all_news_ids():
+    engine = create_engine("postgresql+psycopg2://postgres:100317@db/fakenewsdb")
+    df = pd.read_sql(
+        "SELECT n.id FROM NewsItem n JOIN Label l ON n.id = l.news_id WHERE l.predicted_label IS NULL;",
+        engine
+    )
+    return df["id"].tolist() if not df.empty else []
