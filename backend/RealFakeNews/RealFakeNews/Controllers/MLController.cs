@@ -157,19 +157,20 @@ public class MLController : ControllerBase
         return Content(result, "application/json");
     }
 
-    [HttpGet("interpret/{method}")]
-    public async Task<IActionResult> Interpret(string method, [FromQuery] string? model_name = null)
+    [HttpPost("interpret/{method}")] public async Task<IActionResult> Interpret( string method, [FromQuery] int news_id, [FromQuery] string? model_name = null)
     {
-        string url = $"{_mlServiceUrl}/interpret/{method}";
-        if (!string.IsNullOrEmpty(model_name))
-        {
-            url += $"?model_name={model_name}";
-        }
+       // Формуємо URL з усіма параметрами
+       string url = $"{_mlServiceUrl}/interpret/{method}?news_id={news_id}";
+       if (!string.IsNullOrEmpty(model_name))
+       {
+            url += $"&model_name={model_name}";
+       }
 
-        var response = await GetWithRetryAsync(url);
-        var result = await response.Content.ReadAsStringAsync();
-        return Content(result, "application/json");
+       var response = await PostWithRetryAsync(url, null);
+       var result = await response.Content.ReadAsStringAsync();
+       return Content(result, "application/json");
     }
+
 
     [HttpGet("visualize/{method}")]
     public async Task<IActionResult> Visualize(string method, [FromQuery] string? model_name = null)
