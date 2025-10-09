@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trai
 import torch
 import numpy as np
 import shap
+from captum.attr import IntegratedGradients
 import umap
 from sklearn.manifold import TSNE
 import pandas as pd
@@ -85,19 +86,44 @@ class FakeNewsClassifier(BaseModelInterface):
     def is_trained(self):
         return self.fitted
 
+    def predict_proba(self, texts):
+        emb = embedding_model.encode(texts)
+        return self.clf.predict_proba(emb)
+    
+    def predict_proba_embedded(self, embedded_input):
+        if not hasattr(self, "clf") or not self.fitted:
+            raise RuntimeError("Модель LogisticRegression ще не навчена.")
+    
+         # Якщо подано 1D масив, перетворюємо на 2D
+        if isinstance(embedded_input, list) or len(embedded_input.shape) == 1:
+            embedded_input = np.expand_dims(embedded_input, axis=0)
+
+        probs = self.clf.predict_proba(embedded_input)
+        return probs
+
     # Методи пояснень
     def explain_shap(self, texts):
-        embeddings = embedding_model.encode(texts)
-        explainer = shap.Explainer(self.clf, embeddings)
-        shap_values = explainer(embeddings)
-        return shap_values.values.tolist()
+        if not texts:
+            return []  # або [{"tokens": [], "scores": []}]
+        embeddings = embedding_model.encode(texts, convert_to_numpy=True)
+        background = embedding_model.encode([" "])  # мінімальний background
 
-    def explain_ig(self, texts):
-        embeddings = embedding_model.encode(texts)
-        return np.random.randn(*embeddings.shape).tolist()
+        try:
+            explainer = shap.LinearExplainer(self.clf, background)
+            shap_values = explainer.shap_values(embeddings)
+        except Exception as e:
+            print(f"⚠️ LinearExplainer failed ({e}), falling back to KernelExplainer")
+            explainer = shap.KernelExplainer(self.clf.predict_proba, background)
+            shap_values = explainer.shap_values(embeddings, nsamples=100)
+        
+        # Перетворюємо завжди у 2D список
+        if isinstance(shap_values, list):
+            shap_class1 = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+            return [np.array(shap_class1).tolist()]
+        else:
+            return [np.array(shap_values).tolist()]
+        # return np.array(shap_values).tolist()
 
-    def explain_tcav(self, texts):
-        return [{"concept": "bias", "score": float(np.random.rand())}]
 
     # Тренування з БД
     def run_training(self, test_size=0.3, max_iter=1000, C=1.0, solver="liblinear"):
@@ -119,7 +145,7 @@ class FakeNewsClassifier(BaseModelInterface):
 
         metrics = self.train(X, y, test_size)
         embeddings = embedding_model.encode(X)
-        save_embeddings_bulk(df["id"].tolist(), embeddings)
+        save_embeddings_bulk(df["id"].tolist(), embeddings, model_id="logreg")
 
         for news_id, text in zip(df["id"].tolist(), X):
             label, prob = self.predict(text)
@@ -127,13 +153,13 @@ class FakeNewsClassifier(BaseModelInterface):
 
         # t-SNE + UMAP
         try:
-            tsne_coords = TSNE(n_components=2, random_state=42).fit_transform(embeddings)
+            tsne_coords = TSNE(perplexity=30, learning_rate=200, n_components=2, random_state=42).fit_transform(embeddings)
             save_projection_points(df["id"].tolist(), "TSNE", tsne_coords)
         except Exception as e:
             print("⚠️ TSNE error:", e)
 
         try:
-            umap_coords = umap.UMAP(random_state=42).fit_transform(embeddings)
+            umap_coords = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42).fit_transform(embeddings)
             save_projection_points(df["id"].tolist(), "UMAP", umap_coords)
         except Exception as e:
             print("⚠️ UMAP error:", e)
@@ -142,9 +168,9 @@ class FakeNewsClassifier(BaseModelInterface):
         self.train_running = False
 
 
-# ====== Transformer Classifier ======
-class TransformerClassifier(BaseModelInterface):
-    def __init__(self, model_name="FacebookAI/roberta-base"):
+# ====== BERT-Tiny Classifier ======
+class BertTinyClassifier(BaseModelInterface):
+    def __init__(self, model_name="mrm8488/bert-tiny-finetuned-fake-news-detection"):
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
@@ -171,15 +197,13 @@ class TransformerClassifier(BaseModelInterface):
 
         training_args = TrainingArguments(
             output_dir="./results",
-            num_train_epochs=3, # Зменшено кількість епох
+            num_train_epochs=20,
             per_device_train_batch_size=16,
             per_device_eval_batch_size=16,
             warmup_steps=500,
             weight_decay=0.01,
             logging_dir="./logs",
-            evaluation_strategy="epoch",
-            learning_rate=5e-5, # Додано learning rate
-            load_best_model_at_end=True, # Завантажувати найкращу модель в кінці
+            evaluation_strategy="epoch"
         )
 
         def collate_fn(batch):
@@ -217,6 +241,14 @@ class TransformerClassifier(BaseModelInterface):
             "f1": f1_score(test_labels, y_pred, average="weighted"),
         }
 
+        try:
+            from app.db import load_all_news_ids
+            news_ids = load_all_news_ids()
+            if news_ids:
+                self.save_embeddings_and_predictions(news_ids, texts)
+        except Exception as e:
+            print("⚠️ Error saving predictions for bert-tiny:", e)
+
         self.fitted = True
         return metrics
 
@@ -229,58 +261,202 @@ class TransformerClassifier(BaseModelInterface):
 
     def is_trained(self):
         return self.fitted
+    
+    def predict_proba(self, texts):
+        self.model.eval()
 
+        if isinstance(texts, str):
+            texts = [texts]
+
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            logits = self.model(**enc).logits
+            probs = torch.nn.functional.softmax(logits, dim=-1).cpu().numpy()
+        return probs
+    
+
+    def predict_proba_embedded(self, texts, mask=None):
+
+        self.model.eval()
+
+        enc = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=128,
+            return_tensors="pt"
+        )
+
+        if mask is not None:
+        # обнулюємо attention для токенів із низьким впливом
+            if isinstance(mask, np.ndarray):
+                mask = torch.tensor(mask, dtype=torch.long)
+                attn_shape = enc["attention_mask"].shape
+                if mask.ndim == 1:
+                    mask = mask.unsqueeze(0)
+                if mask.shape[1] < attn_shape[1]:
+                    # доповнюємо до довжини attention_mask
+                    pad_len = attn_shape[1] - mask.shape[1]
+                    mask = torch.cat([mask, torch.zeros((1, pad_len), dtype=torch.long)], dim=1)
+                elif mask.shape[1] > attn_shape[1]:
+                    # обрізаємо зайве
+                    mask = mask[:, :attn_shape[1]]
+            if mask.shape == enc["attention_mask"].shape:
+                enc["attention_mask"] *= mask
+            else:
+                print("⚠️ Маска не узгоджена за розміром, ігнорується.")
+
+        with torch.no_grad():
+            logits = self.model(**enc).logits
+            probs = torch.nn.functional.softmax(logits, dim=-1).cpu().numpy()
+        return probs
+
+
+    # ======== Пояснення SHAP ========
     def explain_shap(self, texts):
         """
-        Explains the model's prediction using SHAP.
-        This implementation is specific to Hugging Face transformer models.
+        Пояснення SHAP для BERT без подвійної токенізації.
+        Використовується shap.maskers.Text(self.tokenizer), який сам формує токени.
         """
-        if not self.fitted:
-            raise Exception("Model is not trained yet.")
 
-        # SHAP explainer for transformers
-        explainer = shap.Explainer(self.model, self.tokenizer)
-
-        # We expect a list of texts, but the endpoint sends one at a time.
         if not texts:
-            return []
+            return {"tokens": [], "scores": []}
 
-        shap_values = explainer(texts)
+        # --- Нормалізація вхідних даних ---
+        if isinstance(texts, str):
+            texts = [texts]
+        elif isinstance(texts, list) and len(texts) == 1 and isinstance(texts[0], list):
+            texts = texts[0]
 
-        # We'll format the output to be more useful for visualization, including tokens.
-        output = []
-        for i in range(len(texts)):
-            explanation = shap_values[i]
-            base_value = explanation.base_values[1]
-            if hasattr(base_value, 'item'):
-                base_value = base_value.item()
+        clean_texts = [str(t).strip() for t in texts if t and str(t).strip()]
+        if not clean_texts:
+            raise ValueError("Порожній текст для explain_shap")
 
-            output.append({
-                "tokens": explanation.data.tolist(),
-                "values": explanation.values[:, 1].tolist(), # SHAP values for "fake" class (index 1)
-                "base_value": base_value
-            })
+        # --- Переключаємо модель у режим оцінки ---
+        self.model.eval()
 
-        # The current API from main.py sends a list with one text.
-        # So we return the first (and only) explanation.
-        return output[0] if output else None
+        # 🔹 SHAP сам подає вже токенізований batch у f(x)
+        def f(x):
+            with torch.no_grad():
+                if isinstance(x, dict):
+                    inputs = {k: v.to(self.model.device) for k, v in x.items()}
+                elif isinstance(x, (list, np.ndarray)):
+                    inputs = self.tokenizer(
+                    list(x),
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                    ).to(self.model.device)
+                else:
+                    raise TypeError(f"Невідомий тип вхідних даних у f(): {type(x)}")
+                outputs = self.model(**inputs)
+                probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu().numpy()
+            return probs
+
+        # --- Ініціалізуємо маскер для текстів ---
+        masker = shap.maskers.Text(self.tokenizer)
+
+        # --- Створюємо пояснювач SHAP ---
+        explainer = shap.Explainer(f, masker)
+
+        # --- Отримуємо SHAP значення ---
+        shap_values = explainer(clean_texts)
+
+        # --- Формуємо результати ---
+        results = []
+        for sv in shap_values:
+            tokens = sv.data
+            if sv.values.ndim > 1:  # двокласова модель
+                scores = sv.values[:, 1].tolist()
+            else:
+                scores = sv.values.tolist()
+            results.append({"tokens": tokens, "scores": scores})
+
+        return results
+    
+
+    # ======== Пояснення IG (Integrated Gradients) ========
+    def explain_ig(self, texts):
+        """
+        Використовує Captum Integrated Gradients для обчислення впливу токенів.
+        """
+        if isinstance(texts, list):
+            if len(texts) == 1 and isinstance(texts[0], str):
+                text = texts[0]
+            else:
+                raise ValueError("IG підтримує лише один текст за раз")
+        elif isinstance(texts, str):
+            text = texts
+        else:
+            raise TypeError(f"Невірний тип вхідних даних: {type(texts)}")
+        
+        self.model.eval()
+        tokenizer = self.tokenizer
+
+        inputs = tokenizer(text, 
+                           return_tensors="pt", 
+                           truncation=True, 
+                           padding=True, 
+                           max_length=512)
+        
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
+        # Отримуємо ембедінги токенів
+        embeddings = self.model.bert.embeddings(input_ids)
+        embeddings.requires_grad_()
+
+        # беремо логіти
+        def forward_func(inputs_embeds):
+            outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+            return outputs.logits[:, 1]
+        
+        ig = IntegratedGradients(forward_func)
+
+        attributions, delta = ig.attribute(embeddings, return_convergence_delta=True)
+
+        scores = attributions.sum(dim=-1).squeeze(0).detach().cpu().numpy().tolist()
+
+        tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+        return {"tokens": tokens, "scores": scores, "delta": float(delta)}
+
+
+    # ======== Пояснення TCAV ========
+    def explain_tcav(self, texts):
+        """
+        Імітаційна TCAV-реалізація: обчислює умовні ваги токенів, що вказують на наявність "концептів".
+        (TCAV зазвичай потребує додаткових концептуальних векторів, тому спрощено.)
+        """
+        text = texts[0]
+        tokens = self.tokenizer.tokenize(text)
+        importance = np.random.uniform(-1, 1, len(tokens))  # імітаційні ваги
+        score = float(np.mean(np.abs(importance)))
+        return {"concept": "contextual_bias", "tokens": tokens, "scores": importance.tolist(), "tcav_score": score}
 
     def save_embeddings_and_predictions(self, news_ids, texts):
         # 1️⃣ Зберігаємо embeddings у БД
-        save_embeddings_bulk(news_ids, self.embeddings, model_id="transformer")
+        save_embeddings_bulk(news_ids, self.embeddings, model_id="bert-tiny")
         # 2️⃣ Зберігаємо прогнозовані мітки
         for i, nid in enumerate(news_ids):
             label, prob = self.predict(texts[i])
             save_predicted_label(nid, label, prob)
         # 3️⃣ t-SNE + UMAP
         try:
-            tsne_coords = TSNE(n_components=2, random_state=42).fit_transform(self.embeddings)
+            tsne_coords = TSNE(perplexity=30, learning_rate=200, n_components=2, random_state=42).fit_transform(self.embeddings)
             save_projection_points(news_ids, "TSNE", tsne_coords)
         except Exception as e:
             print("⚠️ TSNE error:", e)
 
         try:
-            umap_coords = umap.UMAP(random_state=42).fit_transform(self.embeddings)
+            umap_coords = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42).fit_transform(self.embeddings)
             save_projection_points(news_ids, "UMAP", umap_coords)
         except Exception as e:
             print("⚠️ UMAP error:", e)
