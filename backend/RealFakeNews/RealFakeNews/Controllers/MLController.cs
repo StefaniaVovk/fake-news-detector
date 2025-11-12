@@ -4,6 +4,9 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Http;
+using System.Net.Http.Headers;
+
 
 namespace RealFakeNews.Controllers;
 
@@ -14,8 +17,8 @@ public class MLController : ControllerBase
     private readonly HttpClient _http;
     private readonly string _mlServiceUrl;
 
-    private const int MaxRetries = 100;
-    private const int DelayMs = 2000;
+    private const int MaxRetries = 1000;
+    private const int DelayMs = 5000;
 
     public MLController(IHttpClientFactory httpFactory, IConfiguration config)
     {
@@ -66,7 +69,7 @@ public class MLController : ControllerBase
     {
         public double TestSize { get; set; } = 0.3;
         public int MaxIter { get; set; } = 1000;
-        public double C { get; set; } = 1.0;
+        public double C { get; set; } = 5.0;
         public string Solver { get; set; } = "liblinear";
 
         [JsonPropertyName("model_name")]
@@ -185,4 +188,62 @@ public class MLController : ControllerBase
         var result = await response.Content.ReadAsStringAsync();
         return Content(result, "application/json");
     }
+
+    [HttpGet("plots/{plotName}")]
+    public async Task<IActionResult> GetPlot(string plotName, [FromQuery] string? model_name = null)
+    {
+        string url = $"{_mlServiceUrl}/plots/{plotName}";
+        if (!string.IsNullOrEmpty(model_name))
+        {
+            url += $"?model_name={model_name}";
+        }
+
+        var response = await _http.GetAsync(url);
+        if (!response.IsSuccessStatusCode)
+            return StatusCode((int)response.StatusCode, $"ML service error: {response.ReasonPhrase}");
+
+        var contentType = response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";
+        var stream = await response.Content.ReadAsStreamAsync();
+        return File(stream, contentType);
+    }
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register([FromBody] JsonElement data)
+    {
+        var response = await _http.PostAsJsonAsync($"{_mlServiceUrl}/register", data);
+        var content = await response.Content.ReadAsStringAsync();
+        return Content(content, "application/json");
+    }
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login([FromBody] JsonElement data)
+    {
+        var response = await _http.PostAsJsonAsync($"{_mlServiceUrl}/login", data);
+        var content = await response.Content.ReadAsStringAsync();
+        return Content(content, "application/json");
+    }
+
+    [HttpPost("feedback")]
+    public async Task<IActionResult> SubmitFeedback()
+    {
+        var form = await Request.ReadFormAsync();
+        using var content = new MultipartFormDataContent();
+
+        foreach (var field in form)
+        {
+            content.Add(new StringContent(field.Value), field.Key);
+        }
+
+        foreach (var file in form.Files)
+        {
+            var streamContent = new StreamContent(file.OpenReadStream());
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue(file.ContentType);
+            content.Add(streamContent, "files", file.FileName);
+        }
+
+        var response = await _http.PostAsync($"{_mlServiceUrl}/feedback", content);
+        var result = await response.Content.ReadAsStringAsync();
+        return Content(result, "application/json");
+    }
+
 }

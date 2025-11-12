@@ -1,11 +1,24 @@
 // src/ShapHeatmap.jsx
 import React, { useState } from "react";
+import { Bar } from "react-chartjs-2";
+import {
+    Chart as ChartJS,
+    CategoryScale,
+    LinearScale,
+    BarElement,
+    Title,
+    Tooltip,
+    Legend
+} from "chart.js";
 
-export default function ShapHeatmap({ payload, text }) {
-    // 🔹 1. Викликаємо useState одразу — до будь-яких умов
+ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
+
+
+export default function ShapHeatmap({ payload, text, prediction }) {
     const [selectedIndex, setSelectedIndex] = useState(null);
 
-    // 🔹 2. Перевіряємо payload вже після
+    console.log("🔍 prediction:", prediction);
+
     if (!payload || !Array.isArray(payload)) {
         console.warn("⚠️ Немає SHAP значень або невірний формат:", payload);
         return null;
@@ -39,6 +52,14 @@ export default function ShapHeatmap({ payload, text }) {
     const handleTokenClick = (i) => {
         setSelectedIndex(selectedIndex === i ? null : i);
     };
+
+    const combined = tokens.map((t, i) => ({ token: t, value: values[i] }));
+    const top5 = combined
+        .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
+        .slice(0, 5);
+
+    const topTokens = top5.map(d => d.token);
+    const topValues = top5.map(d => d.value);
 
     return (
         <div className="p-3 border rounded bg-white shadow-sm leading-relaxed text-lg text-justify">
@@ -86,6 +107,52 @@ export default function ShapHeatmap({ payload, text }) {
                 🔵 Сині — знижують.
                 Натисни на слово, щоб побачити його вплив.
             </div>
+
+
+            <div className="mt-6">
+                <Bar
+                    data={{
+                        labels: topTokens,
+                        datasets: [
+                            {
+                                label: "Top-5 SHAP Attribution",
+                                data: topValues,
+                                backgroundColor: "rgba(255, 165, 0, 0.8)", // помаранчеві стовпчики
+                                borderRadius: 4,
+                            },
+                        ],
+                    }}
+                    options={{
+                        responsive: true,
+                        plugins: {
+                            legend: { display: false },
+                            title: {
+                                display: true,
+                                text: `SHAP-semantic attributes — ${prediction?.predicted_label?.charAt(0).toUpperCase() + prediction?.predicted_label?.slice(1)
+                                    }`,
+                                font: { size: 14 },
+                            },
+                        },
+                        scales: {
+                            x: {
+                                ticks: {
+                                    autoSkip: false,
+                                    maxRotation: 60,
+                                    minRotation: 45,
+                                },
+                            },
+                            y: {
+                                title: {
+                                    display: true,
+                                    text: "Attribution (a.u.)",
+                                },
+                                beginAtZero: true,
+                            },
+                        },
+                    }}
+                />
+            </div>
+
         </div>
     );
 }
